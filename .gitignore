@@ -30,3 +30,7 @@
 *.exe
 *.out
 *.app
+/.pyinstaller
+/.venv
+/__pycache__
+.DS_Store
