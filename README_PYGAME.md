@@ -30,3 +30,11 @@ python main.py
     - Click left/right bottom buttons
     - Click the progress bar area to toggle Work/Rest (only when paused/stopped)
 
+## Compile
+
+```bash
+mkdir -p .pyinstaller/cache
+PYINSTALLER_CONFIG_DIR="$(pwd)/.pyinstaller" \
+PYINSTALLER_CACHE_DIR="$(pwd)/.pyinstaller/cache" \
+pyinstaller --noconfirm --windowed --name PomodoroTimer --icon assets/tomato.icns main.py
+```
