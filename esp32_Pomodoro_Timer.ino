@@ -46,6 +46,15 @@ static constexpr int kTimerBtnW = 220;
 static constexpr int kTimerBtnH = 62;
 static constexpr int kTimerBtnGap = 8;
 static constexpr int kTimerBtnBottomPad = 8;
+static constexpr int kCountdownArcSize = 178;
+static constexpr int kCountdownArcTopY = 28;
+static constexpr int kArcLabelSessionYOfs = -34;
+static constexpr int kArcLabelTimeYOfs = 30;
+/** Fixed width so "Work" / "Rest" stay optically centered (proportional font). */
+static constexpr lv_coord_t kLabelSessionWidth = 108;
+/** Fixed width so "MM:SS" / "-MM:SS" stays optically centered (proportional font). */
+static constexpr lv_coord_t kLabelTimeWidth = 172;
+static constexpr uint32_t kCountdownArcModeToggleDebounceMs = 280;
 static constexpr uint32_t kPwrDimHoldMs = 900;
 static constexpr uint32_t kPwrOffHoldMs = 2200;
 static constexpr uint32_t kPwrDebounceMs = 50;
@@ -113,7 +122,7 @@ static lv_obj_t *g_timerPanel = nullptr;
 static lv_obj_t *g_setPanel = nullptr;
 static lv_obj_t *g_labelSession = nullptr;
 static lv_obj_t *g_labelTime = nullptr;
-static lv_obj_t *g_countdownBar = nullptr;
+static lv_obj_t *g_countdownArc = nullptr;
 static lv_obj_t *g_btnLeft = nullptr;
 static lv_obj_t *g_btnRight = nullptr;
 static lv_obj_t *g_labelBtnLeft = nullptr;
@@ -126,6 +135,8 @@ static lv_obj_t *g_battCap = nullptr;
 static lv_obj_t *g_battText = nullptr;
 static float g_battVoltage = NAN;
 static uint8_t g_battPct = 0;
+static bool g_countdownArcFingerDown = false;
+static uint32_t g_lastCountdownArcModeToggleMs = 0;
 
 static lv_disp_draw_buf_t draw_buf;
 
@@ -334,7 +345,7 @@ static void battery_poll_and_update() {
 
 static void update_ui() {
   if (g_timerPanel == nullptr || g_setPanel == nullptr || g_labelTime == nullptr ||
-      g_countdownBar == nullptr || g_btnLeft == nullptr || g_btnRight == nullptr ||
+      g_countdownArc == nullptr || g_btnLeft == nullptr || g_btnRight == nullptr ||
       g_labelBtnLeft == nullptr || g_labelBtnRight == nullptr || g_labelSession == nullptr ||
       g_labelSetWorkVal == nullptr || g_labelSetRestVal == nullptr) {
     return;
@@ -386,9 +397,9 @@ static void update_ui() {
       progressPermille = (uint16_t)(((uint32_t)elapsed * 1000UL) / totalSeconds);
     }
   }
-  lv_bar_set_value(g_countdownBar, progressPermille, LV_ANIM_OFF);
-  lv_obj_set_style_bg_color(
-    g_countdownBar,
+  lv_arc_set_value(g_countdownArc, progressPermille);
+  lv_obj_set_style_arc_color(
+    g_countdownArc,
     lv_color_hex((g_sessionType == SessionType::Work) ? 0xFF3B30 : 0x22C55E),
     LV_PART_INDICATOR
   );
@@ -500,13 +511,42 @@ static void on_btn_right(lv_event_t * /*e*/) {
   do_stop_reset();
 }
 
-static void on_countdown_bar_tap(lv_event_t * /*e*/) {
+static void on_countdown_arc_block_drag(lv_event_t *e) {
+  if (lv_event_get_code(e) == LV_EVENT_PRESSING) {
+    lv_event_stop_processing(e);
+  }
+}
+
+static void on_countdown_arc_session_touch(lv_event_t *e) {
+  const lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_PRESSED) {
+    g_countdownArcFingerDown = true;
+    return;
+  }
+  if (code == LV_EVENT_PRESS_LOST) {
+    g_countdownArcFingerDown = false;
+    return;
+  }
+  if (code != LV_EVENT_RELEASED) {
+    return;
+  }
+  if (!g_countdownArcFingerDown) {
+    return;
+  }
+  g_countdownArcFingerDown = false;
+
   if (g_uiMode != UIMode::Timer) {
     return;
   }
   if (g_timerState == TimerState::Running) {
     return;
   }
+  const uint32_t now = millis();
+  if ((now - g_lastCountdownArcModeToggleMs) < kCountdownArcModeToggleDebounceMs) {
+    return;
+  }
+  g_lastCountdownArcModeToggleMs = now;
+
   g_sessionType = (g_sessionType == SessionType::Work) ? SessionType::Rest : SessionType::Work;
   g_timerState = TimerState::Stopped;
   reset_remaining_for_current_session();
@@ -648,36 +688,53 @@ static void build_ui() {
   lv_obj_clear_flag(g_setPanel, LV_OBJ_FLAG_SCROLLABLE);
 
   g_labelSession = lv_label_create(g_timerPanel);
-  lv_obj_set_style_text_font(g_labelSession, &lv_font_montserrat_28, 0);
+  lv_obj_set_style_text_font(g_labelSession, &lv_font_montserrat_24, 0);
   lv_obj_set_style_text_color(g_labelSession, lv_color_hex(0xF2F2F2), 0);
+  lv_obj_set_style_text_align(g_labelSession, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_set_style_bg_opa(g_labelSession, LV_OPA_TRANSP, 0);
   lv_obj_set_style_pad_all(g_labelSession, 0, 0);
+  lv_obj_set_width(g_labelSession, kLabelSessionWidth);
+  lv_label_set_long_mode(g_labelSession, LV_LABEL_LONG_CLIP);
 
-  g_countdownBar = lv_bar_create(g_timerPanel);
-  lv_obj_set_size(g_countdownBar, 228, 100);
-  lv_obj_align(g_countdownBar, LV_ALIGN_TOP_MID, 0, 40);
-  lv_bar_set_range(g_countdownBar, 0, 1000);
-  lv_obj_set_style_radius(g_countdownBar, 16, LV_PART_MAIN);
-  lv_obj_set_style_radius(g_countdownBar, 16, LV_PART_INDICATOR);
-  lv_obj_set_style_bg_color(g_countdownBar, lv_color_hex(0x1B2230), LV_PART_MAIN);
-  lv_obj_set_style_border_width(g_countdownBar, 3, LV_PART_MAIN);
-  lv_obj_set_style_border_color(g_countdownBar, lv_color_hex(0x3D4A63), LV_PART_MAIN);
-  lv_obj_set_style_pad_all(g_countdownBar, 0, LV_PART_MAIN);
-  lv_obj_add_flag(g_countdownBar, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_event_cb(g_countdownBar, on_countdown_bar_tap, LV_EVENT_CLICKED, nullptr);
-  lv_obj_align_to(g_labelSession, g_countdownBar, LV_ALIGN_CENTER, 0, 0);
-  lv_obj_move_foreground(g_labelSession);
+  g_countdownArc = lv_arc_create(g_timerPanel);
+  lv_obj_set_size(g_countdownArc, kCountdownArcSize, kCountdownArcSize);
+  lv_obj_align(g_countdownArc, LV_ALIGN_TOP_MID, 0, kCountdownArcTopY);
+  lv_arc_set_rotation(g_countdownArc, 135);
+  lv_arc_set_bg_angles(g_countdownArc, 0, 270);
+  lv_arc_set_range(g_countdownArc, 0, 1000);
+  lv_arc_set_value(g_countdownArc, 1000);
+  lv_arc_set_mode(g_countdownArc, LV_ARC_MODE_NORMAL);
+
+  lv_obj_set_style_arc_width(g_countdownArc, 12, LV_PART_MAIN);
+  lv_obj_set_style_arc_color(g_countdownArc, lv_color_hex(0x1B2230), LV_PART_MAIN);
+  lv_obj_set_style_arc_width(g_countdownArc, 12, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_rounded(g_countdownArc, true, LV_PART_INDICATOR);
+
+  lv_obj_add_flag(g_countdownArc, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(
+    g_countdownArc, on_countdown_arc_block_drag, (lv_event_code_t)(LV_EVENT_PRESSING | LV_EVENT_PREPROCESS), nullptr
+  );
+  lv_obj_add_event_cb(g_countdownArc, on_countdown_arc_session_touch, LV_EVENT_PRESSED, nullptr);
+  lv_obj_add_event_cb(g_countdownArc, on_countdown_arc_session_touch, LV_EVENT_RELEASED, nullptr);
+  lv_obj_add_event_cb(g_countdownArc, on_countdown_arc_session_touch, LV_EVENT_PRESS_LOST, nullptr);
 
   g_labelTime = lv_label_create(g_timerPanel);
-  lv_obj_set_style_text_font(g_labelTime, &lv_font_montserrat_44, 0);
+  lv_obj_set_style_text_font(g_labelTime, &lv_font_montserrat_36, 0);
   lv_obj_set_style_text_color(g_labelTime, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_style_text_align(g_labelTime, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_bg_opa(g_labelTime, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_pad_all(g_labelTime, 0, 0);
+  lv_obj_set_width(g_labelTime, kLabelTimeWidth);
+  lv_label_set_long_mode(g_labelTime, LV_LABEL_LONG_CLIP);
+
+  lv_obj_align_to(g_labelSession, g_countdownArc, LV_ALIGN_CENTER, 0, kArcLabelSessionYOfs);
+  lv_obj_align_to(g_labelTime, g_countdownArc, LV_ALIGN_CENTER, 0, kArcLabelTimeYOfs);
+  lv_obj_move_foreground(g_labelSession);
+  lv_obj_move_foreground(g_labelTime);
 
   const lv_coord_t bottomSectionH = LCD_HEIGHT / 4;
   const lv_coord_t bottomSectionY = LCD_HEIGHT - bottomSectionH;
   const lv_coord_t halfW = LCD_WIDTH / 2;
-
-  // Keep time just above the bottom button section.
-  lv_obj_align(g_labelTime, LV_ALIGN_BOTTOM_MID, 0, -bottomSectionH - 6);
 
   // Bottom quarter split into left/right halves.
   g_btnRight = lv_btn_create(g_timerPanel);
