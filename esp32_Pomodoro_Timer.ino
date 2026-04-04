@@ -2,11 +2,13 @@
 #include <math.h>
 #include <esp_sleep.h>
 #include <driver/gpio.h>
+#include <Wire.h>
 #include "Arduino_GFX_Library.h"
 #include "Arduino_DriveBus_Library.h"
 #include "pin_config.h"
 #include "lv_conf.h"
 #include "HWCDC.h"
+#include "SensorQMI8658.hpp"
 
 HWCDC USBSerial;
 
@@ -73,6 +75,32 @@ static constexpr int kVoltageDividerPin = 1;  // GPIO1
 static constexpr float kVRef = 3.3f;
 static constexpr float kR1 = 143000.0f;
 static constexpr float kR2 = 65000.0f;
+
+/** Auto-rotation from QMI8658 accelerometer only (gyro off).
+ *  Datasheet Table 15: low-power accel-only (e.g. 21 Hz ≈42 µA) vs ~182 µA @ 1 kHz;
+ *  gyro off avoids ~750–1000 µA 6DOF (Table 17).
+ */
+static SensorQMI8658 g_qmi8658;
+static bool g_qmi8658_ok = false;
+static bool g_disp_rot180 = false;
+static bool g_imu_orient_calibrated = false;
+static int8_t g_imu_dom_axis = -1;
+static float g_imu_ref_axis_g = 0.0f;
+static float g_imu_ax_f = 0.0f;
+static float g_imu_ay_f = 0.0f;
+static float g_imu_az_f = 0.0f;
+static uint32_t g_last_imu_poll_ms = 0;
+static uint8_t g_imu_flip_agree_frames = 0;
+static bool g_imu_want180_pending = false;
+static bool g_imu_lpf_inited = false;
+
+/** Poll near accel ODR (~21 Hz ≈48 ms); debounce keeps rotation < ~500 ms total. */
+static constexpr uint32_t kImuPollMs = 55;
+static constexpr float kImuLpfAlpha = 0.5f;
+static constexpr float kImuNear1GTol = 0.35f;
+static constexpr float kImuFlipProd = 0.3f;
+static constexpr float kImuAxisTrustG = 0.52f;
+static constexpr uint8_t kImuFlipNeedFrames = 4;
 
 enum class SessionType : uint8_t {
   Work = 0,
@@ -167,8 +195,13 @@ void my_touchpad_read(lv_indev_drv_t * /*indev_drv*/, lv_indev_data_t *data) {
       CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y
     );
     if (touchX >= 0 && touchY >= 0) {
-      data->point.x = touchX;
-      data->point.y = touchY;
+      if (g_disp_rot180) {
+        data->point.x = (lv_coord_t)(LCD_WIDTH - 1 - touchX);
+        data->point.y = (lv_coord_t)(LCD_HEIGHT - 1 - touchY);
+      } else {
+        data->point.x = touchX;
+        data->point.y = touchY;
+      }
     }
   } else {
     data->state = LV_INDEV_STATE_RELEASED;
@@ -647,6 +680,121 @@ static void timed_buzzer_poll() {
   g_toneUntilMs = 0;
 }
 
+static void apply_display_rotation180(bool rot180) {
+  if (rot180 == g_disp_rot180) {
+    return;
+  }
+  g_disp_rot180 = rot180;
+  gfx->setRotation(rot180 ? 2 : 0);
+  if (lv_scr_act() != nullptr) {
+    lv_obj_invalidate(lv_scr_act());
+  }
+}
+
+static float imu_axis_value(int8_t axis) {
+  if (axis == 0) {
+    return g_imu_ax_f;
+  }
+  if (axis == 1) {
+    return g_imu_ay_f;
+  }
+  return g_imu_az_f;
+}
+
+static void gravity_orientation_poll() {
+  if (!g_qmi8658_ok) {
+    return;
+  }
+  const uint32_t now = millis();
+  if ((uint32_t)(now - g_last_imu_poll_ms) < kImuPollMs) {
+    return;
+  }
+  g_last_imu_poll_ms = now;
+
+  if (!g_qmi8658.getDataReady()) {
+    return;
+  }
+
+  float ax, ay, az;
+  if (!g_qmi8658.getAccelerometer(ax, ay, az)) {
+    return;
+  }
+
+  if (!g_imu_lpf_inited) {
+    g_imu_ax_f = ax;
+    g_imu_ay_f = ay;
+    g_imu_az_f = az;
+    g_imu_lpf_inited = true;
+  } else {
+    g_imu_ax_f += kImuLpfAlpha * (ax - g_imu_ax_f);
+    g_imu_ay_f += kImuLpfAlpha * (ay - g_imu_ay_f);
+    g_imu_az_f += kImuLpfAlpha * (az - g_imu_az_f);
+  }
+
+  const float mag = sqrtf(g_imu_ax_f * g_imu_ax_f + g_imu_ay_f * g_imu_ay_f + g_imu_az_f * g_imu_az_f);
+  if (fabsf(mag - 1.0f) > kImuNear1GTol) {
+    g_imu_flip_agree_frames = 0;
+    return;
+  }
+
+  const float xa = fabsf(g_imu_ax_f);
+  const float ya = fabsf(g_imu_ay_f);
+  const float za = fabsf(g_imu_az_f);
+
+  if (!g_imu_orient_calibrated) {
+    int8_t dom = 2;
+    float s = g_imu_az_f;
+    if (xa >= ya && xa >= za) {
+      dom = 0;
+      s = g_imu_ax_f;
+    } else if (ya >= xa && ya >= za) {
+      dom = 1;
+      s = g_imu_ay_f;
+    }
+    if (fabsf(s) < kImuAxisTrustG) {
+      return;
+    }
+    g_imu_dom_axis = dom;
+    g_imu_ref_axis_g = s;
+    g_imu_orient_calibrated = true;
+    return;
+  }
+
+  const float s_now = imu_axis_value(g_imu_dom_axis);
+  if (fabsf(s_now) < kImuAxisTrustG) {
+    g_imu_flip_agree_frames = 0;
+    return;
+  }
+
+  bool want180 = g_disp_rot180;
+  const float prod = s_now * g_imu_ref_axis_g;
+  if (prod < -kImuFlipProd) {
+    want180 = true;
+  } else if (prod > kImuFlipProd) {
+    want180 = false;
+  } else {
+    g_imu_flip_agree_frames = 0;
+    return;
+  }
+
+  if (want180 == g_disp_rot180) {
+    g_imu_flip_agree_frames = 0;
+    return;
+  }
+
+  if (g_imu_flip_agree_frames == 0 || want180 != g_imu_want180_pending) {
+    g_imu_want180_pending = want180;
+    g_imu_flip_agree_frames = 1;
+  } else {
+    g_imu_flip_agree_frames++;
+  }
+
+  if (g_imu_flip_agree_frames >= kImuFlipNeedFrames) {
+    apply_display_rotation180(want180);
+    g_imu_flip_agree_frames = 0;
+  }
+}
+
 static void mode_button_poll() {
   const uint32_t now = millis();
   const int level = digitalRead(kModeButtonPin);
@@ -923,6 +1071,20 @@ void setup() {
     CST816T->Arduino_IIC_Touch::Device_Mode::TOUCH_DEVICE_INTERRUPT_PERIODIC
   );
 
+  if (!g_qmi8658.begin(Wire, QMI8658_L_SLAVE_ADDRESS, IIC_SDA, IIC_SCL)) {
+    g_qmi8658_ok = false;
+    USBSerial.println("QMI8658 init failed (auto-rotation disabled)");
+  } else {
+    (void)g_qmi8658.disableGyroscope();
+    (void)g_qmi8658.configAccelerometer(
+      SensorQMI8658::ACC_RANGE_2G,
+      SensorQMI8658::ACC_ODR_LOWPOWER_21Hz,
+      SensorQMI8658::LPF_MODE_1);
+    g_qmi8658.enableAccelerometer();
+    g_qmi8658_ok = true;
+    USBSerial.println("QMI8658 OK (accel 21 Hz low-power, gyro off)");
+  }
+
   pinMode(kBeePin, OUTPUT);
   digitalWrite(kBeePin, LOW);
   pinMode(kSysEnPin, OUTPUT);
@@ -1007,6 +1169,7 @@ void loop() {
   mode_button_poll();
   idle_backlight_poll();
   battery_poll_and_update();
+  gravity_orientation_poll();
   lv_timer_handler();
   delay(5);
 }
