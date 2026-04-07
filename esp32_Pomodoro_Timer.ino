@@ -76,30 +76,23 @@ static constexpr float kVRef = 3.3f;
 static constexpr float kR1 = 143000.0f;
 static constexpr float kR2 = 65000.0f;
 
-/** Auto-rotation from QMI8658 accelerometer only (gyro off).
- *  Datasheet Table 15: low-power accel-only (e.g. 21 Hz ≈42 µA) vs ~182 µA @ 1 kHz;
- *  gyro off avoids ~750–1000 µA 6DOF (Table 17).
+/** Auto-rotation from QMI8658 accelerometer X only (gyro off, no calibration).
+ *  Datasheet Table 15: low-power accel-only (e.g. 21 Hz); gyro off saves 6DOF power.
  */
 static SensorQMI8658 g_qmi8658;
 static bool g_qmi8658_ok = false;
 static bool g_disp_rot180 = false;
-static bool g_imu_orient_calibrated = false;
-static int8_t g_imu_dom_axis = -1;
-static float g_imu_ref_axis_g = 0.0f;
 static float g_imu_ax_f = 0.0f;
-static float g_imu_ay_f = 0.0f;
-static float g_imu_az_f = 0.0f;
 static uint32_t g_last_imu_poll_ms = 0;
 static uint8_t g_imu_flip_agree_frames = 0;
 static bool g_imu_want180_pending = false;
 static bool g_imu_lpf_inited = false;
 
-/** Poll near accel ODR (~21 Hz ≈48 ms); debounce keeps rotation < ~500 ms total. */
+/** Poll near accel ODR (~21 Hz ≈48 ms); debounce keeps rotation responsive. */
 static constexpr uint32_t kImuPollMs = 55;
 static constexpr float kImuLpfAlpha = 0.5f;
-static constexpr float kImuNear1GTol = 0.35f;
-static constexpr float kImuFlipProd = 0.3f;
-static constexpr float kImuAxisTrustG = 0.52f;
+/** Hysteresis on X (g): ax < -this ⇒ rot 180; ax > +this ⇒ rot 0; between ⇒ hold. */
+static constexpr float kImuXHystG = 0.22f;
 static constexpr uint8_t kImuFlipNeedFrames = 4;
 
 enum class SessionType : uint8_t {
@@ -691,16 +684,6 @@ static void apply_display_rotation180(bool rot180) {
   }
 }
 
-static float imu_axis_value(int8_t axis) {
-  if (axis == 0) {
-    return g_imu_ax_f;
-  }
-  if (axis == 1) {
-    return g_imu_ay_f;
-  }
-  return g_imu_az_f;
-}
-
 static void gravity_orientation_poll() {
   if (!g_qmi8658_ok) {
     return;
@@ -719,58 +702,20 @@ static void gravity_orientation_poll() {
   if (!g_qmi8658.getAccelerometer(ax, ay, az)) {
     return;
   }
+  (void)ay;
+  (void)az;
 
   if (!g_imu_lpf_inited) {
     g_imu_ax_f = ax;
-    g_imu_ay_f = ay;
-    g_imu_az_f = az;
     g_imu_lpf_inited = true;
   } else {
     g_imu_ax_f += kImuLpfAlpha * (ax - g_imu_ax_f);
-    g_imu_ay_f += kImuLpfAlpha * (ay - g_imu_ay_f);
-    g_imu_az_f += kImuLpfAlpha * (az - g_imu_az_f);
-  }
-
-  const float mag = sqrtf(g_imu_ax_f * g_imu_ax_f + g_imu_ay_f * g_imu_ay_f + g_imu_az_f * g_imu_az_f);
-  if (fabsf(mag - 1.0f) > kImuNear1GTol) {
-    g_imu_flip_agree_frames = 0;
-    return;
-  }
-
-  const float xa = fabsf(g_imu_ax_f);
-  const float ya = fabsf(g_imu_ay_f);
-  const float za = fabsf(g_imu_az_f);
-
-  if (!g_imu_orient_calibrated) {
-    int8_t dom = 2;
-    float s = g_imu_az_f;
-    if (xa >= ya && xa >= za) {
-      dom = 0;
-      s = g_imu_ax_f;
-    } else if (ya >= xa && ya >= za) {
-      dom = 1;
-      s = g_imu_ay_f;
-    }
-    if (fabsf(s) < kImuAxisTrustG) {
-      return;
-    }
-    g_imu_dom_axis = dom;
-    g_imu_ref_axis_g = s;
-    g_imu_orient_calibrated = true;
-    return;
-  }
-
-  const float s_now = imu_axis_value(g_imu_dom_axis);
-  if (fabsf(s_now) < kImuAxisTrustG) {
-    g_imu_flip_agree_frames = 0;
-    return;
   }
 
   bool want180 = g_disp_rot180;
-  const float prod = s_now * g_imu_ref_axis_g;
-  if (prod < -kImuFlipProd) {
+  if (g_imu_ax_f < -kImuXHystG) {
     want180 = true;
-  } else if (prod > kImuFlipProd) {
+  } else if (g_imu_ax_f > kImuXHystG) {
     want180 = false;
   } else {
     g_imu_flip_agree_frames = 0;
