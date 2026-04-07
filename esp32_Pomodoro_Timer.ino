@@ -71,6 +71,7 @@ static constexpr uint8_t kBacklightPwmBits = 8;
 static constexpr uint8_t kBacklightFull = 255;
 static constexpr uint8_t kBacklightDim = 50;
 static constexpr uint32_t kIdleDimTimeoutMs = 60000;
+static constexpr uint32_t kIdleShutdownTimeoutMs = 3600000;
 static constexpr int kVoltageDividerPin = 1;  // GPIO1
 static constexpr float kVRef = 3.3f;
 static constexpr float kR1 = 143000.0f;
@@ -161,6 +162,7 @@ static uint32_t g_lastCountdownArcModeToggleMs = 0;
 
 static lv_disp_draw_buf_t draw_buf;
 
+static void enter_poweroff_sleep(const bool wait_for_pwr_release);
 void my_disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *px_map) {
   const uint32_t w = (area->x2 - area->x1 + 1);
   const uint32_t h = (area->y2 - area->y1 + 1);
@@ -245,6 +247,17 @@ static void idle_backlight_poll() {
   }
   g_backlightDimmed = true;
   backlight_set(kBacklightDim);
+}
+
+static void idle_shutdown_poll() {
+  if (g_screenOff || g_pwrPressedStable) {
+    return;
+  }
+  const uint32_t now = millis();
+  if ((now - g_lastActivityMs) < kIdleShutdownTimeoutMs) {
+    return;
+  }
+  enter_poweroff_sleep(false);
 }
 
 static inline void reset_power_button_state() {
@@ -750,6 +763,7 @@ static void mode_button_poll() {
   if (level == HIGH && g_modeBtnLastLevel == LOW) {
     const uint32_t held = now - g_modeBtnLowSinceMs;
     if (held >= kModeDebounceMs && held < kModeShortPressMaxMs) {
+      g_lastActivityMs = now;
       g_uiMode = (g_uiMode == UIMode::Timer) ? UIMode::Set : UIMode::Timer;
       ui_click_beep();
       update_ui();
@@ -1113,6 +1127,7 @@ void loop() {
   power_button_poll();
   mode_button_poll();
   idle_backlight_poll();
+  idle_shutdown_poll();
   battery_poll_and_update();
   gravity_orientation_poll();
   lv_timer_handler();
