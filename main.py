@@ -7,7 +7,11 @@
 from __future__ import annotations
 
 from array import array
+import ctypes
+import ctypes.util
 import math
+import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from enum import Enum
@@ -17,7 +21,7 @@ import pygame
 
 LOGICAL_W = 240
 LOGICAL_H = 280
-SCALE = 1  # desktop scale factor
+SCALE = 1.0 # desktop scale factor
 
 
 class SessionType(Enum):
@@ -47,6 +51,111 @@ class Alarm333:
 
 def clamp(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
+
+
+def lv_checkbox_indicator_rect(row: pygame.Rect, size: int) -> pygame.Rect:
+    """Logical rect for an LVGL-style lv_checkbox indicator (left side of a row)."""
+    return pygame.Rect(row.left, row.centery - size // 2, size, size)
+
+
+def draw_lv_checkbox_indicator(surf: pygame.Surface, rect: pygame.Rect, checked: bool) -> None:
+    """Draw lv_checkbox PART_INDICATOR: bordered box; when checked, a tick like default LVGL theme."""
+    border_rgb = (224, 228, 236)
+    tick_rgb = (240, 243, 250)
+    pygame.draw.rect(surf, border_rgb, rect, width=1, border_radius=3)
+    if not checked:
+        return
+    x, y, w, h = rect.x, rect.y, rect.w, rect.h
+    pad = max(3, w // 5)
+    pts = (
+        (x + pad, y + h // 2 - 1),
+        (x + w // 2 - 1, y + h - pad),
+        (x + w - pad, y + pad + 1),
+    )
+    pygame.draw.lines(surf, tick_rgb, False, pts, width=2)
+
+
+def set_window_always_on_top(enabled: bool) -> None:
+    """Raise or lower the pygame window in the stacking order (best-effort per OS)."""
+    if not pygame.display.get_init():
+        return
+    try:
+        wm = pygame.display.get_wm_info()
+    except pygame.error:
+        return
+
+    if sys.platform == "win32":
+        hwnd = wm.get("window")
+        if hwnd is None:
+            return
+        HWND_TOPMOST = -1
+        HWND_NOTOPMOST = -2
+        SWP_NOSIZE = 0x0001
+        SWP_NOMOVE = 0x0002
+        SWP_NOACTIVATE = 0x0010
+        flags = SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
+        try:
+            from ctypes import wintypes
+
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            user32.SetWindowPos.argtypes = [
+                wintypes.HWND,
+                wintypes.HWND,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_uint,
+            ]
+            user32.SetWindowPos.restype = wintypes.BOOL
+            z = HWND_TOPMOST if enabled else HWND_NOTOPMOST
+            user32.SetWindowPos(hwnd, z, 0, 0, 0, 0, flags)
+        except Exception:
+            pass
+        return
+
+    if sys.platform == "darwin":
+        capsule = wm.get("window")
+        if capsule is None:
+            return
+        try:
+            PyCapsule_GetPointer = ctypes.pythonapi.PyCapsule_GetPointer
+            PyCapsule_GetPointer.restype = ctypes.c_void_p
+            PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
+            nswin = PyCapsule_GetPointer(capsule, b"window")
+        except Exception:
+            return
+        if not nswin:
+            return
+        try:
+            objc_lib = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
+            objc_lib.sel_registerName.restype = ctypes.c_void_p
+            objc_lib.sel_registerName.argtypes = [ctypes.c_char_p]
+            sel = objc_lib.sel_registerName(b"setLevel:")
+            # NSFloatingWindowLevel (3) vs NSNormalWindowLevel (0)
+            level = 3 if enabled else 0
+            msg_send = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long)(
+                ("objc_msgSend", objc_lib)
+            )
+            msg_send(nswin, sel, level)
+        except Exception:
+            pass
+        return
+
+    if sys.platform.startswith("linux") and shutil.which("wmctrl"):
+        wid = wm.get("window")
+        if not isinstance(wid, int):
+            return
+        op = "add" if enabled else "remove"
+        try:
+            subprocess.run(
+                ["wmctrl", "-i", "-r", str(wid), "-b", f"{op},above"],
+                capture_output=True,
+                timeout=2,
+                check=False,
+            )
+        except Exception:
+            pass
 
 
 def format_mmss(remaining_seconds: int) -> str:
@@ -208,6 +317,7 @@ class PomodoroApp:
         self.session_type = SessionType.WORK
         self.timer_state = TimerState.STOPPED
         self.ui_mode = UIMode.TIMER
+        self.always_on_top = False
         self.remaining_seconds = self.work_minutes * 60
         self.last_second_tick_ms = 0
 
@@ -331,6 +441,11 @@ class PomodoroApp:
         self._ui_click()
         self._sync_labels()
 
+    def _toggle_always_on_top(self):
+        self.always_on_top = not self.always_on_top
+        set_window_always_on_top(self.always_on_top)
+        self._ui_click()
+
     def _build_ui(self):
         bottom_section_h = LOGICAL_H // 4
         bottom_section_y = LOGICAL_H - bottom_section_h
@@ -338,6 +453,14 @@ class PomodoroApp:
 
         self.rect_bar = pygame.Rect(6, 40, 228, 100)  # matches LVGL size; centered-ish with padding
         self.rect_gear = pygame.Rect(6, 6, 32, 32)
+        self.rect_aot = pygame.Rect(
+            self.rect_gear.right + 4,
+            6,
+            LOGICAL_W - (self.rect_gear.right + 4) - 6,
+            32,
+        )
+        self.rect_cb_aot = lv_checkbox_indicator_rect(self.rect_aot, 16)
+        self._aot_label_x = self.rect_cb_aot.right + 6
 
         self.btn_left = UIButton(
             pygame.Rect(0, bottom_section_y, half_w, bottom_section_h),
@@ -500,6 +623,11 @@ class PomodoroApp:
         if self.btn_gear.handle_event(e):
             return
 
+        if e.type == pygame.MOUSEBUTTONUP and e.button == 1:
+            if self.rect_aot.collidepoint(e.pos):
+                self._toggle_always_on_top()
+                return
+
         if self.ui_mode == UIMode.TIMER:
             if self.btn_left.handle_event(e):
                 return
@@ -574,17 +702,17 @@ class PomodoroApp:
 
         # Work row (top half)
         work_title = self.font_small.render("Work", True, (255, 255, 255))
-        surf.blit(work_title, work_title.get_rect(midtop=(LOGICAL_W // 2, 10)))
+        surf.blit(work_title, work_title.get_rect(midright=(LOGICAL_W // 2 - 8, 52)))
         work_val = self.font_session.render(f"{self.work_minutes} min", True, (255, 255, 255))
-        surf.blit(work_val, work_val.get_rect(midtop=(LOGICAL_W // 2, 40)))
+        surf.blit(work_val, work_val.get_rect(midleft=(LOGICAL_W // 2 + 8, 52)))
         self.btn_work_minus.draw(surf)
         self.btn_work_plus.draw(surf)
 
         # Rest row (bottom half)
         rest_title = self.font_small.render("Rest", True, (255, 255, 255))
-        surf.blit(rest_title, rest_title.get_rect(midtop=(LOGICAL_W // 2, row_h + 10)))
+        surf.blit(rest_title, rest_title.get_rect(midright=(LOGICAL_W // 2 - 8, row_h + 52)))
         rest_val = self.font_session.render(f"{self.rest_minutes} min", True, (255, 255, 255))
-        surf.blit(rest_val, rest_val.get_rect(midtop=(LOGICAL_W // 2, row_h + 40)))
+        surf.blit(rest_val, rest_val.get_rect(midleft=(LOGICAL_W // 2 + 8, row_h + 52)))
         self.btn_rest_minus.draw(surf)
         self.btn_rest_plus.draw(surf)
 
@@ -597,6 +725,13 @@ class PomodoroApp:
             self._draw_set_screen(self.canvas)
 
         self.btn_gear.draw(self.canvas)
+
+        draw_lv_checkbox_indicator(self.canvas, self.rect_cb_aot, self.always_on_top)
+        aot_surf = self.font_small.render("always-on-top", True, (200, 200, 200))
+        self.canvas.blit(
+            aot_surf,
+            aot_surf.get_rect(midleft=(self._aot_label_x, self.rect_aot.centery)),
+        )
 
         scaled = pygame.transform.scale(self.canvas, self.screen.get_size())
         self.screen.blit(scaled, (0, 0))
